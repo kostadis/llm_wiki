@@ -442,7 +442,13 @@
     "dismissSelected": "Dismiss selected",
     "affectedPages": "Pages",
     "allClear": "All clear — nothing to review",
-    "resolvedDivider": "— Resolved —"
+    "resolvedDivider": "— Resolved —",
+    "bulkCreatePages": "Create pages",
+    "bulkCreating": "Creating…",
+    "bulkCreateHint": "Create pages from all selected items with a Create/Add action",
+    "bulkResearch": "Research",
+    "bulkResearching": "Queuing…",
+    "bulkResearchHint": "Queue Deep Research for all selected items"
   },
   "settings": {
     "title": "Settings",

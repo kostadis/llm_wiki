@@ -46,5 +46,19 @@ describe("createReviewPageDrafts", () => {
       { title: "Policy version gap", pageType: "query", dir: "queries" },
     ])
   })
+
+  it("does not emit a spurious colon-prefixed duplicate for 'Missing page: X'", () => {
+    // Regression: the englishMissing fallback previously captured the colon,
+    // producing both "Alpha" and a junk ": Alpha" page for "Missing page: Alpha".
+    const drafts = createReviewPageDrafts(
+      review({ title: "Missing page: Alpha", description: "" }),
+      "Create Page",
+    )
+
+    expect(drafts).toEqual([
+      { title: "Alpha", pageType: "concept", dir: "concepts" },
+    ])
+    expect(drafts.some((d) => d.title.includes(":"))).toBe(false)
+  })
 })
 

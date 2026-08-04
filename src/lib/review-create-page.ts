@@ -45,7 +45,7 @@ function extractMissingPageCandidates(text: string): string[] {
     const chineseMissing = segment.match(/(?:缺少|缺失|未创建|没有)\s*([^；;]+?)(?:等)?\s*(?:实体|概念)?\s*(?:页面|页)(?:缺失|不存在|未创建)?/i)
     if (chineseMissing?.[1]) candidates.push(...splitCandidateList(chineseMissing[1]))
 
-    const englishMissing = segment.match(/missing\s+(?:entity|entities|concept|concepts|page|pages)?\s*([^.;]+?)(?:\s+pages?|\s+entities?|\s+concepts?)?$/i)
+    const englishMissing = segment.match(/missing\s+(?:entity|entities|concept|concepts|page|pages)?\s*([^.;:：]+?)(?:\s+pages?|\s+entities?|\s+concepts?)?$/i)
     if (englishMissing?.[1]) candidates.push(...splitCandidateList(englishMissing[1]))
   }
 

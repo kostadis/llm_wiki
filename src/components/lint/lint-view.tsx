@@ -347,6 +347,7 @@ export function LintView() {
       if (refreshTree) {
         await refreshProjectFileTree(pp, {
           projectId: project.id,
+          clearDisplayTreeFirst: true,
           bumpDataVersion: true,
         })
       }
@@ -486,6 +487,7 @@ export function LintView() {
       if (filesystemChanged) {
         await refreshProjectFileTree(pp, {
           projectId: project.id,
+          clearDisplayTreeFirst: true,
           bumpDataVersion: true,
         })
       }
@@ -510,7 +512,7 @@ export function LintView() {
 
   async function batchRefresh(pp: string) {
     if (!project) return
-    await refreshProjectFileTree(pp, { projectId: project.id, bumpDataVersion: true })
+    await refreshProjectFileTree(pp, { projectId: project.id, clearDisplayTreeFirst: true, bumpDataVersion: true })
   }
 
   // Apply every suggested link at once: group by source page so each page is

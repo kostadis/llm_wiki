@@ -20,7 +20,11 @@ import { normalizePath } from "@/lib/path-utils"
 import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
 import { hasConfiguredDeepResearchSources } from "@/lib/web-search"
 import { makeQueryFileName } from "@/lib/wiki-filename"
-import { createReviewPageDrafts } from "@/lib/review-create-page"
+import {
+  createPageEligible,
+  researchEligible,
+  writeReviewPagesForItems,
+} from "@/lib/review-bulk-create"
 import { cleanAssistantContentForWikiSave, titleFromCleanAssistantContent } from "@/lib/chat-save-to-wiki"
 import { useTranslation } from "react-i18next"
 import { useResearchStore } from "@/stores/research-store"
@@ -43,6 +47,8 @@ export function ReviewView() {
   const project = useWikiStore((s) => s.project)
   const [refreshing, setRefreshing] = useState(false)
   const [selectedReviewIds, setSelectedReviewIds] = useState<Set<string>>(() => new Set())
+  const [creatingBulk, setCreatingBulk] = useState(false)
+  const [researchingBulk, setResearchingBulk] = useState(false)
 
   // Reload review items from disk. The review pane has no equivalent of
   // lint's re-run, so external writers — the resolve API, another window,
@@ -120,6 +126,7 @@ export function ReviewView() {
 
         await refreshProjectFileTree(pp, {
           projectId: project.id,
+          clearDisplayTreeFirst: true,
           bumpDataVersion: true,
         })
         useWikiStore.getState().openFileInPreview(filePath, pageContent)
@@ -158,6 +165,7 @@ export function ReviewView() {
         await deleteFile(filePath)
         await refreshProjectFileTree(pp, {
           projectId: project.id,
+          clearDisplayTreeFirst: true,
           bumpDataVersion: true,
         })
         resolveItem(id, "Deleted")
@@ -190,66 +198,22 @@ export function ReviewView() {
       // the `__create_page__:` sentinel (forced via the "no search API"
       // fallback branch above) and actions that heuristically look like
       // a create instruction.
-      const realAction = action.startsWith("__create_page__:")
-        ? action.slice("__create_page__:".length)
-        : action
       if (item) {
         try {
-          const drafts = createReviewPageDrafts(item, realAction)
-          const created: Array<{
-            title: string
-            dir: string
-            fileName: string
-            filePath: string
-            pageContent: string
-            pageType: string
-            date: string
-          }> = []
-
-          for (const draft of drafts) {
-            const { date, fileName } = makeQueryFileName(draft.title)
-            const filePath = `${pp}/wiki/${draft.dir}/${fileName}`
-            const frontmatter = `---\ntype: ${draft.pageType}\ntitle: "${draft.title.replace(/"/g, '\\"')}"\ncreated: ${date}\ntags: []\nrelated: []\n---\n\n`
-            const body = `# ${draft.title}\n\n${item.description}\n`
-            const pageContent = frontmatter + body
-            await writeFile(filePath, pageContent)
-            created.push({ title: draft.title, dir: draft.dir, fileName, filePath, pageContent, pageType: draft.pageType, date })
+          const created = await writeReviewPagesForItems(pp, [item])
+          if (created.length === 0) {
+            resolveItem(id, "Create failed")
+          } else {
+            await refreshProjectFileTree(pp, {
+              projectId: project.id,
+              clearDisplayTreeFirst: true,
+              bumpDataVersion: true,
+            })
+            useWikiStore.getState().openFileInPreview(created[0].filePath, created[0].pageContent)
+            resolveItem(id, created.length === 1
+              ? `Created: wiki/${created[0].dir}/${created[0].fileName}`
+              : `Created ${created.length} pages`)
           }
-
-          // Update index
-          const indexPath = `${pp}/wiki/index.md`
-          let indexContent = ""
-          try { indexContent = await readFile(indexPath) } catch { indexContent = "# Wiki Index\n" }
-          for (const createdPage of created) {
-            const sectionHeader = `## ${createdPage.dir.charAt(0).toUpperCase() + createdPage.dir.slice(1)}`
-            const linkTarget = createdPage.fileName.replace(/\.md$/, "")
-            const entry = `- [[${createdPage.dir}/${linkTarget}|${createdPage.title}]]`
-            if (indexContent.includes(sectionHeader)) {
-              indexContent = indexContent.replace(new RegExp(`(${sectionHeader}\n)`), (match) => `${match}${entry}\n`)
-            } else {
-              indexContent = indexContent.trimEnd() + `\n\n${sectionHeader}\n${entry}\n`
-            }
-          }
-          await writeFile(indexPath, indexContent)
-
-          // Log
-          const logPath = `${pp}/wiki/log.md`
-          let logContent = ""
-          try { logContent = await readFile(logPath) } catch { logContent = "# Wiki Log\n" }
-          const createdNames = created.map((p) => `\`${p.fileName}\``).join(", ")
-          const logDate = created[0]?.date ?? makeQueryFileName("review").date
-          await writeFile(logPath, logContent.trimEnd() + `\n- ${logDate}: Created ${created.length} page${created.length === 1 ? "" : "s"} from review: ${createdNames}\n`)
-
-          await refreshProjectFileTree(pp, {
-            projectId: project.id,
-            bumpDataVersion: true,
-          })
-          const first = created[0]
-          if (first) useWikiStore.getState().openFileInPreview(first.filePath, first.pageContent)
-
-          resolveItem(id, created.length === 1
-            ? `Created: wiki/${created[0].dir}/${created[0].fileName}`
-            : `Created ${created.length} pages`)
         } catch (err) {
           console.error("Failed to create page from review:", err)
           resolveItem(id, "Create failed")
@@ -305,6 +269,79 @@ export function ReviewView() {
     setSelectedReviewIds(new Set())
   }, [dismissItem, selectedPendingIds])
 
+  // Selected pending items, and the subsets each bulk action applies to.
+  const selectedItems = useMemo(
+    () => pending.filter((i) => selectedReviewIds.has(i.id)),
+    [pending, selectedReviewIds],
+  )
+  const createEligibleSelected = useMemo(
+    () => selectedItems.filter(createPageEligible),
+    [selectedItems],
+  )
+  const researchEligibleSelected = useMemo(
+    () => selectedItems.filter(researchEligible),
+    [selectedItems],
+  )
+
+  // Bulk "Create pages": reuse the same write path as the per-item fix, but for
+  // every selected eligible item, then resolve each with what was created.
+  const handleBatchCreatePages = useCallback(async () => {
+    if (!project || creatingBulk || createEligibleSelected.length === 0) return
+    const pp = normalizePath(project.path)
+    setCreatingBulk(true)
+    try {
+      const created = await writeReviewPagesForItems(pp, createEligibleSelected)
+      // Resolve only items that actually produced a page; leave the rest pending.
+      const createdById = new Map<string, number>()
+      for (const page of created) {
+        createdById.set(page.id, (createdById.get(page.id) ?? 0) + 1)
+      }
+      for (const item of createEligibleSelected) {
+        const count = createdById.get(item.id) ?? 0
+        if (count > 0) {
+          resolveItem(item.id, count === 1 ? "Created (bulk)" : `Created ${count} pages (bulk)`)
+        }
+      }
+      if (created.length > 0) {
+        await refreshProjectFileTree(pp, {
+          projectId: project.id,
+          clearDisplayTreeFirst: true,
+          bumpDataVersion: true,
+        })
+        useWikiStore.getState().openFileInPreview(created[0].filePath, created[0].pageContent)
+      }
+      setSelectedReviewIds(new Set())
+    } catch (err) {
+      console.error("Bulk create pages failed:", err)
+    } finally {
+      setCreatingBulk(false)
+    }
+  }, [project, creatingBulk, createEligibleSelected, resolveItem])
+
+  // Bulk Deep Research: queue research for every selected eligible item. Items
+  // resolve when their research task saves (deep-research.ts), so we don't mark
+  // them resolved here.
+  const handleBatchResearch = useCallback(() => {
+    if (!project || researchingBulk || researchEligibleSelected.length === 0) return
+    const searchConfig = useWikiStore.getState().searchApiConfig
+    if (!hasConfiguredDeepResearchSources(searchConfig)) {
+      window.alert(t("research.notConfigured"))
+      return
+    }
+    setResearchingBulk(true)
+    try {
+      const pp = normalizePath(project.path)
+      const llmConfig = useWikiStore.getState().llmConfig
+      for (const item of researchEligibleSelected) {
+        const topic = item.title.replace(/^(Save to Wiki|Create|Research)[:\s]*/i, "").trim() || item.description.split("\n")[0]
+        queueResearch(pp, topic, llmConfig, searchConfig, item.searchQueries, item.id)
+      }
+      setSelectedReviewIds(new Set())
+    } finally {
+      setResearchingBulk(false)
+    }
+  }, [project, researchingBulk, researchEligibleSelected, t])
+
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center justify-between border-b px-4 py-3">
@@ -359,6 +396,26 @@ export function ReviewView() {
             onClick={handleBatchResolve}
           >
             {t("review.markSelectedResolved")}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 text-xs"
+            disabled={createEligibleSelected.length === 0 || creatingBulk}
+            onClick={handleBatchCreatePages}
+            title={t("review.bulkCreateHint", "Create pages from all selected items with a Create/Add action")}
+          >
+            {creatingBulk ? t("review.bulkCreating", "Creating…") : t("review.bulkCreatePages", "Create pages")}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 text-xs"
+            disabled={researchEligibleSelected.length === 0 || researchingBulk}
+            onClick={handleBatchResearch}
+            title={t("review.bulkResearchHint", "Queue Deep Research for all selected items")}
+          >
+            🔍 {researchingBulk ? t("review.bulkResearching", "Queuing…") : t("review.bulkResearch", "Research")}
           </Button>
           <Button
             variant="outline"
