@@ -11,12 +11,25 @@ import {
   Wrench,
   Trash2,
   Link,
+  Link2,
+  ChevronRight,
+  ChevronDown,
+  FilePlus,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { useWikiStore } from "@/stores/wiki-store"
 import { useReviewStore } from "@/stores/review-store"
 import { useLintStore, type LintItem } from "@/stores/lint-store"
-import { runStructuralLint, runSemanticLint } from "@/lib/lint"
+import {
+  runStructuralLint,
+  runSemanticLint,
+  runLinkSuggestions,
+  resolveBrokenLinksByEmbedding,
+  resolveOrphansByEmbedding,
+  resolveNoOutlinksByEmbedding,
+  buildBrokenLinkStub,
+  loadWikiPageTypes,
+} from "@/lib/lint"
 import { hasUsableLlm } from "@/lib/has-usable-llm"
 import { readFile, writeFile } from "@/commands/fs"
 import { normalizePath } from "@/lib/path-utils"
@@ -29,21 +42,29 @@ import {
 import { useTranslation } from "react-i18next"
 
 export function groupLintResultsForDisplay(results: readonly LintItem[]): {
+  suggestions: LintItem[]
   warnings: LintItem[]
   infos: LintItem[]
 } {
+  const suggestions: LintItem[] = []
   const warnings: LintItem[] = []
   const infos: LintItem[] = []
 
   results.forEach((result) => {
-    if (result.severity === "warning") {
+    if (result.type === "suggested-link") {
+      suggestions.push(result)
+    } else if (result.severity === "warning") {
       warnings.push(result)
     } else {
       infos.push(result)
     }
   })
 
-  return { warnings, infos }
+  // Surface actionable broken links (those with a repoint target) first.
+  const repointable = (i: LintItem) => i.type === "broken-link" && !!i.suggestedTarget
+  warnings.sort((a, b) => Number(repointable(b)) - Number(repointable(a)))
+
+  return { suggestions, warnings, infos }
 }
 
 export function shouldShowLintResults(hasRun: boolean, itemCount: number): boolean {
@@ -62,6 +83,7 @@ export function LintView() {
     "broken-link": { icon: Link2Off, label: t("lint.typeLabels.broken-link") },
     "no-outlinks": { icon: ArrowUpRight, label: t("lint.typeLabels.no-outlinks") },
     semantic: { icon: BrainCircuit, label: t("lint.typeLabels.semantic") },
+    "suggested-link": { icon: Link2, label: t("lint.typeLabels.suggested-link") },
   }), [t])
 
   const items = useLintStore((s) => s.items)
@@ -73,13 +95,60 @@ export function LintView() {
   const [lintProgress, setLintProgress] = useState<{ completed: number; total: number } | null>(null)
   const [hasRun, setHasRun] = useState(false)
   const [runSemantic, setRunSemantic] = useState(false)
+  const [semanticMode, setSemanticMode] = useState<"batch" | "cluster">("batch")
+  const [suggestLinks, setSuggestLinks] = useState(false)
+  const [suggestMode, setSuggestMode] = useState<"fast" | "confirm">("fast")
   const [fixingId, setFixingId] = useState<string | null>(null)
   const [batchFixing, setBatchFixing] = useState(false)
   const [fixError, setFixError] = useState<string | null>(null)
   const [selectedLintIds, setSelectedLintIds] = useState<Set<string>>(() => new Set())
+  const [addingAll, setAddingAll] = useState(false)
+  const [repointingAll, setRepointingAll] = useState(false)
+  const [creatingStubs, setCreatingStubs] = useState(false)
+  const [linkingAllNoOutlinks, setLinkingAllNoOutlinks] = useState(false)
+  const [connectingAll, setConnectingAll] = useState(false)
+  const [suggestionsOpen, setSuggestionsOpen] = useState(false)
+  // Stub-page type for broken-link "Create page" fixes. "auto" infers from the
+  // source page's folder; otherwise the chosen type is written verbatim.
+  const [stubType, setStubType] = useState<string>("auto")
+  const [wikiTypes, setWikiTypes] = useState<string[]>([])
   const lintAbortRef = useRef<AbortController | null>(null)
 
+  const embeddingConfig = useWikiStore((s) => s.embeddingConfig)
+  // turbovecdb-service URL is shared with the dedup embedding scan (kept in
+  // localStorage while that path is experimental — see maintenance-section).
+  const serviceUrl = useMemo(
+    () => localStorage.getItem("dedup.turbovecServiceUrl") || "http://127.0.0.1:8077",
+    [],
+  )
+  const clusterAvailable = !!embeddingConfig?.enabled && !!embeddingConfig?.endpoint
+  const llmReady = hasUsableLlm(llmConfig)
+
   useEffect(() => () => lintAbortRef.current?.abort(), [])
+
+  // Discover the wiki's actual page types to populate the stub-type selector,
+  // once there are stubs to create. Always offer entity/concept as fallbacks.
+  const stubbableCount = useMemo(
+    () =>
+      new Set(
+        items
+          .filter((i) => i.type === "broken-link" && i.brokenTarget && !i.suggestedTarget)
+          .map((i) => i.brokenTarget!.toLowerCase()),
+      ).size,
+    [items],
+  )
+  useEffect(() => {
+    if (!project || stubbableCount === 0) return
+    let cancelled = false
+    loadWikiPageTypes(normalizePath(project.path)).then((ts) => {
+      if (!cancelled) setWikiTypes(ts)
+    })
+    return () => { cancelled = true }
+  }, [project, stubbableCount])
+  const stubTypeOptions = useMemo(
+    () => [...new Set(["entity", "concept", ...wikiTypes])].sort(),
+    [wikiTypes],
+  )
 
   const handleRunLint = useCallback(async () => {
     if (!project || running) return
@@ -98,9 +167,33 @@ export function LintView() {
       })
       let all = structural
 
+      // Embedding fallback: fill "did you mean?" targets for broken links the
+      // lexical pass couldn't match; attach related pages to orphans (backlink
+      // source) and no-outlinks (forward-link target). Gated on the same
+      // embedding opt-in as link suggestions; no-ops when no unresolved items.
+      if (clusterAvailable) {
+        all = await resolveBrokenLinksByEmbedding(pp, all, embeddingConfig, controller.signal)
+        all = await resolveOrphansByEmbedding(pp, all, embeddingConfig, controller.signal)
+        all = await resolveNoOutlinksByEmbedding(pp, all, embeddingConfig, controller.signal)
+      }
+
       if (runSemantic && hasUsableLlm(llmConfig)) {
-        const semantic = await runSemanticLint(pp, llmConfig, controller.signal)
-        all = [...structural, ...semantic]
+        const semantic = await runSemanticLint(pp, llmConfig, {
+          mode: semanticMode,
+          embeddingConfig,
+          serviceUrl,
+          signal: controller.signal,
+        })
+        all = [...all, ...semantic]
+      }
+
+      if (suggestLinks && clusterAvailable) {
+        const links = await runLinkSuggestions(pp, embeddingConfig, serviceUrl, {
+          mode: suggestMode,
+          llmConfig: hasUsableLlm(llmConfig) ? llmConfig : undefined,
+          signal: controller.signal,
+        })
+        all = [...all, ...links]
       }
 
       addLintItems(all)
@@ -114,7 +207,7 @@ export function LintView() {
       setRunning(false)
       setLintProgress(null)
     }
-  }, [project, llmConfig, running, runSemantic, addLintItems, clearLintItems])
+  }, [project, llmConfig, running, runSemantic, semanticMode, suggestLinks, suggestMode, clusterAvailable, embeddingConfig, serviceUrl, addLintItems, clearLintItems])
 
   async function handleOpenPage(page: string) {
     if (!project) return
@@ -229,6 +322,20 @@ export function LintView() {
           break
         }
 
+        case "suggested-link": {
+          // Add the suggested cross-link directly: append [[target]] to the
+          // source page's ## Related section.
+          const target = item.affectedPages?.[0]
+          if (target) {
+            const sourcePath = `${pp}/wiki/${item.page}`
+            const linkText = target.replace(/\.md$/, "").replace(/^.*\//, "")
+            const content = await readFile(sourcePath)
+            await writeFile(sourcePath, appendWikilink(content, linkText))
+          }
+          useLintStore.getState().removeItem(item.id)
+          break
+        }
+
         default: {
           // Semantic issues → send to Review for manual resolution
           addLintItemToReview(item)
@@ -279,7 +386,7 @@ export function LintView() {
     }
   }
 
-  const { warnings, infos } = useMemo(
+  const { suggestions, warnings, infos } = useMemo(
     () => groupLintResultsForDisplay(items),
     [items],
   )
@@ -386,6 +493,211 @@ export function LintView() {
     }
   }, [addLintItemToReview, batchFixing, project, removeLintItems, selectedLintItems])
 
+  // ── Batch auto-triage (restored QoL lane) ──────────────────────────────────
+
+  const connectableCount = useMemo(
+    () => infos.filter((i) => i.type === "orphan" && i.suggestedSource).length,
+    [infos],
+  )
+  const linkableNoOutlinksCount = useMemo(
+    () => infos.filter((i) => i.type === "no-outlinks" && !!i.affectedPages?.[0]).length,
+    [infos],
+  )
+  const repointableCount = useMemo(
+    () => warnings.filter((i) => i.type === "broken-link" && i.suggestedTarget).length,
+    [warnings],
+  )
+
+  async function batchRefresh(pp: string) {
+    if (!project) return
+    await refreshProjectFileTree(pp, { projectId: project.id, bumpDataVersion: true })
+  }
+
+  // Apply every suggested link at once: group by source page so each page is
+  // read/written a single time, even when it has many suggested targets.
+  async function handleAddAllLinks() {
+    if (!project || addingAll) return
+    const pp = normalizePath(project.path)
+    const suggestionsList = items.filter((i) => i.type === "suggested-link")
+    if (suggestionsList.length === 0) return
+    setAddingAll(true)
+    try {
+      const byPage = new Map<string, LintItem[]>()
+      for (const it of suggestionsList) {
+        const list = byPage.get(it.page)
+        if (list) list.push(it)
+        else byPage.set(it.page, [it])
+      }
+      let changed = false
+      for (const [page, list] of byPage) {
+        const sourcePath = `${pp}/wiki/${page}`
+        try {
+          let content = await readFile(sourcePath)
+          for (const it of list) {
+            const target = it.affectedPages?.[0]
+            if (!target) continue
+            content = appendWikilink(content, target.replace(/\.md$/, "").replace(/^.*\//, ""))
+          }
+          await writeFile(sourcePath, content)
+          changed = true
+          list.forEach((it) => useLintStore.getState().removeItem(it.id))
+        } catch (err) {
+          console.error(`Add-all links failed for ${page}:`, err)
+        }
+      }
+      if (changed) await batchRefresh(pp)
+    } finally {
+      setAddingAll(false)
+    }
+  }
+
+  // Repoint every broken link with a "did you mean?" target at once.
+  async function handleRepointAll() {
+    if (!project || repointingAll) return
+    const pp = normalizePath(project.path)
+    const repointable = items.filter(
+      (i) => i.type === "broken-link" && i.brokenTarget && i.suggestedTarget,
+    )
+    if (repointable.length === 0) return
+    setRepointingAll(true)
+    try {
+      const byPage = new Map<string, LintItem[]>()
+      for (const it of repointable) {
+        const list = byPage.get(it.page)
+        if (list) list.push(it)
+        else byPage.set(it.page, [it])
+      }
+      let changed = false
+      for (const [page, list] of byPage) {
+        const sourcePath = `${pp}/wiki/${page}`
+        try {
+          let content = await readFile(sourcePath)
+          for (const it of list) {
+            if (!it.brokenTarget || !it.suggestedTarget) continue
+            content = rewriteWikilinkTarget(content, it.brokenTarget, it.suggestedTarget)
+          }
+          await writeFile(sourcePath, content)
+          changed = true
+          list.forEach((it) => useLintStore.getState().removeItem(it.id))
+        } catch (err) {
+          console.error(`Repoint-all failed for ${page}:`, err)
+        }
+      }
+      if (changed) await batchRefresh(pp)
+    } finally {
+      setRepointingAll(false)
+    }
+  }
+
+  // Create a stub page for every broken link with no repoint target. Deduped by
+  // target text so a shared [[target]] stub is created once.
+  async function handleCreateAllStubs() {
+    if (!project || creatingStubs) return
+    const pp = normalizePath(project.path)
+    const stubbable = items.filter(
+      (i) => i.type === "broken-link" && i.brokenTarget && !i.suggestedTarget,
+    )
+    if (stubbable.length === 0) return
+    setCreatingStubs(true)
+    const byTarget = new Map<string, LintItem[]>()
+    for (const it of stubbable) {
+      const key = it.brokenTarget!.toLowerCase()
+      const list = byTarget.get(key)
+      if (list) list.push(it)
+      else byTarget.set(key, [it])
+    }
+    const today = new Date().toISOString().slice(0, 10)
+    try {
+      let changed = false
+      for (const list of byTarget.values()) {
+        const first = list[0]
+        const stub = buildBrokenLinkStub(
+          first.brokenTarget!,
+          first.page,
+          today,
+          stubType === "auto" ? undefined : stubType,
+        )
+        if (!stub) continue
+        const stubPath = `${pp}/wiki/${stub.path}`
+        try {
+          let exists = false
+          try { await readFile(stubPath); exists = true } catch { exists = false }
+          if (!exists) { await writeFile(stubPath, stub.content); changed = true }
+          list.forEach((it) => useLintStore.getState().removeItem(it.id))
+        } catch (err) {
+          console.error(`Create-stub failed for ${stub.path}:`, err)
+        }
+      }
+      if (changed) await batchRefresh(pp)
+    } finally {
+      setCreatingStubs(false)
+    }
+  }
+
+  // Add a forward link to every no-outlinks page that has an embedding-suggested
+  // target.
+  async function handleAddAllNoOutlinks() {
+    if (!project || linkingAllNoOutlinks) return
+    const pp = normalizePath(project.path)
+    const linkable = items.filter((i) => i.type === "no-outlinks" && i.affectedPages?.[0])
+    if (linkable.length === 0) return
+    setLinkingAllNoOutlinks(true)
+    try {
+      let changed = false
+      for (const it of linkable) {
+        const target = it.affectedPages![0]
+        const sourcePath = `${pp}/wiki/${it.page}`
+        const linkText = target.replace(/\.md$/, "").replace(/^.*\//, "")
+        try {
+          const content = await readFile(sourcePath)
+          const updated = appendWikilink(content, linkText)
+          if (updated !== content) { await writeFile(sourcePath, updated); changed = true }
+          useLintStore.getState().removeItem(it.id)
+        } catch (err) {
+          console.error(`Add-all no-outlinks failed for ${it.page}:`, err)
+        }
+      }
+      if (changed) await batchRefresh(pp)
+    } finally {
+      setLinkingAllNoOutlinks(false)
+    }
+  }
+
+  // Connect every orphan that has an embedding-suggested source page at once.
+  async function handleConnectAllOrphans() {
+    if (!project || connectingAll) return
+    const pp = normalizePath(project.path)
+    const connectable = items.filter((i) => i.type === "orphan" && i.suggestedSource)
+    if (connectable.length === 0) return
+    setConnectingAll(true)
+    const bySource = new Map<string, LintItem[]>()
+    for (const it of connectable) {
+      const list = bySource.get(it.suggestedSource!)
+      if (list) list.push(it)
+      else bySource.set(it.suggestedSource!, [it])
+    }
+    try {
+      let changed = false
+      for (const [source, list] of bySource) {
+        const sourcePath = `${pp}/wiki/${source}`
+        try {
+          let content = await readFile(sourcePath)
+          for (const it of list) {
+            content = appendWikilink(content, it.page.replace(/\.md$/, "").replace(/^.*\//, ""))
+          }
+          await writeFile(sourcePath, content)
+          changed = true
+          list.forEach((it) => useLintStore.getState().removeItem(it.id))
+        } catch (err) {
+          console.error(`Connect-all orphans failed for ${source}:`, err)
+        }
+      }
+      if (changed) await batchRefresh(pp)
+    } finally {
+      setConnectingAll(false)
+    }
+  }
+
   return (
     <div className="flex h-full flex-col">
       <div className="shrink-0 flex items-center justify-between border-b px-4 py-3">
@@ -407,6 +719,49 @@ export function LintView() {
             />
             {t("lint.semantic")}
           </label>
+          {runSemantic && (
+            <select
+              value={semanticMode}
+              onChange={(e) => setSemanticMode(e.target.value as "batch" | "cluster")}
+              title={
+                clusterAvailable
+                  ? "How to split a large wiki across LLM calls"
+                  : "Cluster mode needs an embedding endpoint (Settings → Embeddings)"
+              }
+              className="h-6 rounded border bg-background px-1.5 text-xs text-muted-foreground"
+            >
+              <option value="batch">Batched</option>
+              <option value="cluster" disabled={!clusterAvailable}>
+                Clustered (embeddings)
+              </option>
+            </select>
+          )}
+          <label
+            className="flex items-center gap-1.5 text-xs text-muted-foreground cursor-pointer"
+            title={clusterAvailable ? "Suggest links between related but disconnected pages" : "Needs an embedding endpoint (Settings → Embeddings)"}
+          >
+            <input
+              type="checkbox"
+              className="h-3 w-3"
+              checked={suggestLinks}
+              disabled={!clusterAvailable}
+              onChange={(e) => setSuggestLinks(e.target.checked)}
+            />
+            {t("lint.suggestLinks")}
+          </label>
+          {suggestLinks && clusterAvailable && (
+            <select
+              value={suggestMode}
+              onChange={(e) => setSuggestMode(e.target.value as "fast" | "confirm")}
+              title="Fast = embeddings only. Confirmed = an LLM keeps only useful links."
+              className="h-6 rounded border bg-background px-1.5 text-xs text-muted-foreground"
+            >
+              <option value="fast">Fast (embeddings)</option>
+              <option value="confirm" disabled={!llmReady}>
+                Confirmed (LLM)
+              </option>
+            </select>
+          )}
           <Button
             size="sm"
             variant={running ? "outline" : "default"}
@@ -487,8 +842,93 @@ export function LintView() {
           </div>
         ) : (
           <div className="flex flex-col gap-2 p-3">
+            {suggestions.length > 0 && (
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center gap-2 px-1 py-1 text-xs font-semibold text-primary">
+                  <button
+                    type="button"
+                    onClick={() => setSuggestionsOpen((v) => !v)}
+                    className="flex items-center gap-1.5 hover:opacity-80"
+                  >
+                    {suggestionsOpen ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+                    <Link2 className="h-3.5 w-3.5" />
+                    {t("lint.suggestedLinks", { count: suggestions.length })}
+                  </button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="ml-auto h-6 text-xs gap-1"
+                    disabled={addingAll}
+                    onClick={handleAddAllLinks}
+                  >
+                    <Link2 className="h-3 w-3" />
+                    {addingAll ? t("lint.adding") : t("lint.addAllLinks")}
+                  </Button>
+                </div>
+                {suggestionsOpen &&
+                  suggestions.map((item) => (
+                    <LintCard
+                      key={item.id}
+                      item={item}
+                      fixing={fixingId === item.id}
+                      selected={selectedLintIds.has(item.id)}
+                      onSelectedChange={setLintSelected}
+                      onOpenPage={handleOpenPage}
+                      onFix={handleFix}
+                      typeConfig={typeConfig}
+                      t={t}
+                    />
+                  ))}
+              </div>
+            )}
             {warnings.length > 0 && (
-              <SectionHeader icon={AlertTriangle} label={t("lint.warnings")} count={warnings.length} color="text-amber-500" t={t} />
+              <div className="flex items-center gap-2 px-1 py-1 text-xs font-semibold text-amber-500">
+                <AlertTriangle className="h-3.5 w-3.5" />
+                {t("lint.sectionCount", { label: t("lint.warnings"), count: warnings.length })}
+                {(repointableCount > 0 || stubbableCount > 0) && (
+                  <div className="ml-auto flex items-center gap-1.5">
+                    {stubbableCount > 0 && (
+                      <select
+                        value={stubType}
+                        onChange={(e) => setStubType(e.target.value)}
+                        title="Type for stub pages created from broken links"
+                        className="h-6 rounded border bg-background px-1.5 text-xs font-normal text-muted-foreground"
+                      >
+                        <option value="auto">Type: auto</option>
+                        {stubTypeOptions.map((ty) => (
+                          <option key={ty} value={ty}>
+                            Type: {ty}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                    {repointableCount > 0 && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-6 text-xs gap-1"
+                        disabled={repointingAll}
+                        onClick={handleRepointAll}
+                      >
+                        <Link2 className="h-3 w-3" />
+                        {repointingAll ? t("lint.repointing") : t("lint.repointAll", { count: repointableCount })}
+                      </Button>
+                    )}
+                    {stubbableCount > 0 && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-6 text-xs gap-1"
+                        disabled={creatingStubs}
+                        onClick={handleCreateAllStubs}
+                      >
+                        <FilePlus className="h-3 w-3" />
+                        {creatingStubs ? t("lint.creating") : t("lint.createStubs", { count: stubbableCount })}
+                      </Button>
+                    )}
+                  </div>
+                )}
+              </div>
             )}
             {warnings.map((item) => (
               <LintCard
@@ -505,7 +945,38 @@ export function LintView() {
               />
             ))}
             {infos.length > 0 && (
-              <SectionHeader icon={Info} label={t("lint.info")} count={infos.length} color="text-blue-500" t={t} />
+              <div className="flex items-center gap-2 px-1 py-1 text-xs font-semibold text-blue-500">
+                <Info className="h-3.5 w-3.5" />
+                {t("lint.sectionCount", { label: t("lint.info"), count: infos.length })}
+                {(connectableCount > 0 || linkableNoOutlinksCount > 0) && (
+                  <div className="ml-auto flex items-center gap-1.5">
+                    {connectableCount > 0 && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-6 text-xs gap-1"
+                        disabled={connectingAll}
+                        onClick={handleConnectAllOrphans}
+                      >
+                        <Link2 className="h-3 w-3" />
+                        {connectingAll ? t("lint.connecting") : t("lint.connectAll", { count: connectableCount })}
+                      </Button>
+                    )}
+                    {linkableNoOutlinksCount > 0 && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-6 text-xs gap-1"
+                        disabled={linkingAllNoOutlinks}
+                        onClick={handleAddAllNoOutlinks}
+                      >
+                        <Link2 className="h-3 w-3" />
+                        {linkingAllNoOutlinks ? t("lint.adding") : t("lint.linkNoOutlinksAll", { count: linkableNoOutlinksCount })}
+                      </Button>
+                    )}
+                  </div>
+                )}
+              </div>
             )}
             {infos.map((item) => (
               <LintCard
@@ -524,27 +995,6 @@ export function LintView() {
           </div>
         )}
       </div>
-    </div>
-  )
-}
-
-function SectionHeader({
-  icon: Icon,
-  label,
-  count,
-  color,
-  t,
-}: {
-  icon: typeof AlertTriangle
-  label: string
-  count: number
-  color: string
-  t: (key: string, opts?: Record<string, unknown>) => string
-}) {
-  return (
-    <div className={`flex items-center gap-1.5 px-1 py-1 text-xs font-semibold ${color}`}>
-      <Icon className="h-3.5 w-3.5" />
-      {t("lint.sectionCount", { label, count })}
     </div>
   )
 }
@@ -642,8 +1092,25 @@ function LintCard({
           disabled={fixing}
           onClick={() => onFix(item)}
         >
-          <Wrench className="h-3 w-3" />
-          {fixing ? t("lint.fixing") : t("lint.fix")}
+          {item.type === "suggested-link"
+            || (item.type === "broken-link" && item.suggestedTarget)
+            || (item.type === "orphan" && item.suggestedSource)
+            || (item.type === "no-outlinks" && !!item.affectedPages?.[0])
+            ? <Link2 className="h-3 w-3" />
+            : item.type === "broken-link" && item.brokenTarget
+              ? <FilePlus className="h-3 w-3" />
+              : <Wrench className="h-3 w-3" />}
+          {item.type === "suggested-link"
+            ? (fixing ? t("lint.adding") : t("lint.addLink"))
+            : item.type === "broken-link" && item.suggestedTarget
+              ? (fixing ? t("lint.repointing") : t("lint.repointTarget", { target: item.suggestedTarget }))
+              : item.type === "broken-link" && item.brokenTarget
+                ? (fixing ? t("lint.creating") : t("lint.createPage"))
+                : item.type === "orphan" && item.suggestedSource
+                  ? (fixing ? t("lint.linking") : t("lint.addBacklink"))
+                  : item.type === "no-outlinks" && item.affectedPages?.[0]
+                    ? (fixing ? t("lint.adding") : t("lint.addLinkTarget"))
+                    : (fixing ? t("lint.fixing") : t("lint.fix"))}
         </Button>
         {onDelete && (
           <Button
