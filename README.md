@@ -413,6 +413,26 @@ npm run tauri dev      # Development
 npm run tauri build    # Production build
 ```
 
+#### Command Reference
+
+`npm run tauri dev` is the one command to remember — it starts both the Vite frontend
+and the Rust/Tauri backend and opens the desktop app window. `npm run dev` alone opens
+only the frontend in a browser (no desktop window, no Rust backend).
+
+| Command | What it does |
+|---------|--------------|
+| `npm run tauri dev` | **Start the app in development** (frontend + backend + desktop window) |
+| `npm run dev` | Start only the Vite frontend in a browser (no Rust backend) |
+| `npm run build` | Type-check + build the frontend for production |
+| `npm run build:desktop` | Install mcp-server deps + build the full desktop app for distribution |
+| `npm run tauri build` | Build an installable app (`.deb` / `.AppImage` / `.dmg` / `.msi`) |
+| `npm run typecheck` | Check TypeScript errors only |
+| `npm run test` | Run the test suite |
+| `npm run mcp:build` | Build the bundled MCP server (`mcp-server/`) |
+
+> **Note:** the first `npm run tauri dev` compiles the entire Rust backend and can take
+> a few minutes. Subsequent runs are much faster.
+
 ### Chrome Extension
 
 1. Open `chrome://extensions`
